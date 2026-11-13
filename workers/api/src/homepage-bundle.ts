@@ -26,7 +26,9 @@ type Bundle = {
   sources: unknown;
 };
 
-const staleRefreshes = new WeakMap<R2Bucket, Map<string, Promise<void>>>();
+type PendingRefresh = { expiresAt: number; promise: Promise<void> };
+const refreshSharingMs = 30_000;
+const staleRefreshes = new WeakMap<R2Bucket, Map<string, PendingRefresh>>();
 
 function refreshStaleBundle(env: Env, generation: number): Promise<void> {
   let pending = staleRefreshes.get(env.RAW);
@@ -34,21 +36,35 @@ function refreshStaleBundle(env: Env, generation: number): Promise<void> {
     pending = new Map();
     staleRefreshes.set(env.RAW, pending);
   }
+  const now = Date.now();
+  // A stopped request may leave its I/O unresolved. Expire sharing lazily,
+  // including older generations, without changing response freshness limits.
+  for (const [key, entry] of pending) {
+    if (entry.expiresAt <= now) {
+      pending.delete(key);
+    }
+  }
   const identity = JSON.stringify([env.ENVIRONMENT ?? null, generation]);
   const existing = pending.get(identity);
   if (existing) {
-    return existing;
+    return existing.promise;
   }
-  const refresh = createBundle(env, generation)
-    .then(async (bundle) => {
+  const refresh = publicCacheGenerationFresh(env.DB)
+    .then(async (currentGeneration) => {
+      if (currentGeneration !== generation) {
+        return;
+      }
+      const bundle = await createBundle(env, generation);
       if (bundle) {
         await writeBundle(env, bundle);
       }
     })
     .finally(() => {
-      pending.delete(identity);
+      if (pending.get(identity)?.promise === refresh) {
+        pending.delete(identity);
+      }
     });
-  pending.set(identity, refresh);
+  pending.set(identity, { expiresAt: now + refreshSharingMs, promise: refresh });
   return refresh;
 }
 

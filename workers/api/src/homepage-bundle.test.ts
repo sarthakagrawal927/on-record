@@ -199,6 +199,66 @@ describe('generation-validated homepage bundle', () => {
     expect(JSON.parse(state.stored() ?? '{}').generation).toBe(2);
   });
 
+  it('bounds sharing of a stuck refresh and keeps its late settlement from clearing the retry', async () => {
+    const state = fixture();
+    const cached = bundle(1, 6 * 60 * 1000);
+    state.set(cached);
+    const startedAt = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(startedAt);
+    const original = deferred();
+    const replacement = deferred();
+    const route = vi.spyOn(publicRoute, 'request').mockImplementation(async (url) => {
+      await (route.mock.calls.length <= 5 ? original.promise : replacement.promise);
+      return Response.json(payload(String(url)));
+    });
+    const first = await state.request();
+    expect(await first.text()).toBe(JSON.stringify(cached));
+    clock.mockReturnValue(startedAt + 29_999);
+    await state.request();
+    expect(route).toHaveBeenCalledTimes(5);
+    clock.mockReturnValue(startedAt + 30_000);
+    const retried = await state.request();
+    expect(await retried.text()).toBe(JSON.stringify(cached));
+    expect(retried.headers.get('cache-control')).toBe('no-store');
+    expect(route).toHaveBeenCalledTimes(10);
+    original.resolve();
+    await state.waits[0];
+    state.set(cached);
+    await state.request();
+    expect(route).toHaveBeenCalledTimes(10);
+    replacement.resolve();
+    await Promise.all(state.waits);
+    expect(state.put).toHaveBeenCalledTimes(2);
+  });
+
+  it('cancels before building when publication advances during the initial R2 read', async () => {
+    const state = fixture(true);
+    const cached = bundle(1, 6 * 60 * 1000);
+    state.set(cached);
+    const readStarted = deferred();
+    const readReady = deferred();
+    const get = state.get.getMockImplementation();
+    state.get.mockImplementation(async () => {
+      const snapshot = await get?.();
+      readStarted.resolve();
+      await readReady.promise;
+      return snapshot ?? null;
+    });
+    const route = vi
+      .spyOn(publicRoute, 'request')
+      .mockImplementation(async (url) => Response.json(payload(String(url))));
+    const pending = state.request();
+    await readStarted.promise;
+    currentGeneration = 2;
+    readReady.resolve();
+    const response = await pending;
+    expect(await response.text()).toBe(JSON.stringify(cached));
+    expect(response.headers.get(D1_BOOKMARK_HEADER)).toBe('response-bookmark-1');
+    await Promise.all(state.waits);
+    expect(route).not.toHaveBeenCalled();
+    expect(state.put).not.toHaveBeenCalled();
+  });
+
   it.each(['bucket', 'environment'])('isolates stale refreshes by %s', async (scope) => {
     const first = fixture();
     const second = fixture();
