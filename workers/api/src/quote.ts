@@ -1,7 +1,7 @@
 export type QuoteAnchor = { start: number; end: number };
 
 export function normalizeWs(text: string): string {
-  return text.trim().split(/\s+/u).join(' ');
+  return text.trim().replace(/\s+/gu, ' ');
 }
 
 function buildNormMap(text: string): { norm: string; map: number[] } {
