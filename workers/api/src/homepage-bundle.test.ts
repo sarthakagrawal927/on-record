@@ -1,7 +1,9 @@
 import { Hono } from 'hono';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Env } from './env';
+import api from './index';
 import { publicRoute } from './routes/public';
+import { D1_BOOKMARK_HEADER } from './session';
 
 let currentGeneration = 1;
 let generationRead: (() => Promise<number>) | undefined;
@@ -32,7 +34,7 @@ function payload(path: string): unknown {
   return { people: 0, episodes: 0, publishedClaims: 0 };
 }
 
-function fixture() {
+function fixture(withSessions = false) {
   let stored: string | undefined;
   let uploaded = new Date();
   const get = vi.fn(async () =>
@@ -42,22 +44,36 @@ function fixture() {
     stored = text;
     uploaded = new Date();
   });
-  const env = { DB: {}, RAW: { get, put } } as unknown as Env;
+  const anchors: Array<string | undefined> = [];
+  const env = {
+    DB: {
+      withSession: (anchor?: string) => {
+        anchors.push(anchor);
+        const bookmark = `response-bookmark-${anchors.length}`;
+        return { getBookmark: () => bookmark };
+      },
+    },
+    RAW: { get, put },
+    ENVIRONMENT: 'test',
+  } as unknown as Env;
   const waits: Promise<unknown>[] = [];
   const executionCtx = {
     waitUntil: (promise: Promise<unknown>) => waits.push(promise),
   } as unknown as ExecutionContext;
-  const app = new Hono<{ Bindings: Env }>();
-  app.get('/api/homepage-bundle', homepageBundle);
-  const request = () =>
+  const app = withSessions ? api : new Hono<{ Bindings: Env }>();
+  if (!withSessions) {
+    app.get('/api/homepage-bundle', homepageBundle);
+  }
+  const request = (init?: RequestInit, bindings = env, background = true) =>
     app.request(
       'https://api.podcasts.highsignal.app/api/homepage-bundle',
-      undefined,
-      env,
-      executionCtx
+      init,
+      bindings,
+      background ? executionCtx : undefined
     );
   return {
     env,
+    anchors,
     get,
     put,
     request,
@@ -72,6 +88,21 @@ function fixture() {
     },
     stored: () => stored,
   };
+}
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+function holdPublicRoutes(gate: Promise<void>) {
+  return vi.spyOn(publicRoute, 'request').mockImplementation(async (url) => {
+    await gate;
+    return Response.json(payload(String(url)));
+  });
 }
 
 function bundle(generation = 1, ageMs = 0) {
@@ -93,6 +124,234 @@ afterEach(() => {
 });
 
 describe('generation-validated homepage bundle', () => {
+  it('does not start refresh work without a background execution context', async () => {
+    const state = fixture();
+    const cached = bundle(1, 6 * 60 * 1000);
+    state.set(cached);
+    const route = vi.spyOn(publicRoute, 'request');
+    const response = await state.request(undefined, state.env, false);
+    expect(await response.text()).toBe(JSON.stringify(cached));
+    expect(route).not.toHaveBeenCalled();
+    expect(state.put).not.toHaveBeenCalled();
+    expect(state.waits).toHaveLength(0);
+  });
+
+  it('coalesces overlapping stale refreshes through the write without sharing responses or bookmarks', async () => {
+    const state = fixture(true);
+    const cached = bundle(1, 6 * 60 * 1000);
+    state.set(cached);
+    const routesReady = deferred();
+    const writeReady = deferred();
+    const route = holdPublicRoutes(routesReady.promise);
+    const write = state.put.getMockImplementation();
+    state.put.mockImplementation(async (objectKey, text) => {
+      await writeReady.promise;
+      await write?.(objectKey, text);
+    });
+
+    const responses = await Promise.all(Array.from({ length: 4 }, () => state.request()));
+    expect(await Promise.all(responses.map((response) => response.text()))).toEqual(
+      Array.from({ length: 4 }, () => JSON.stringify(cached))
+    );
+    expect(responses.map((response) => response.headers.get(D1_BOOKMARK_HEADER))).toEqual([
+      'response-bookmark-1',
+      'response-bookmark-2',
+      'response-bookmark-3',
+      'response-bookmark-4',
+    ]);
+    expect(state.anchors).toEqual(Array.from({ length: 4 }, () => 'first-unconstrained'));
+    expect(route).toHaveBeenCalledTimes(5);
+    expect(
+      route.mock.calls.filter(([url]) =>
+        /\/(stats|recommendation-groups)(?:\?|$)/u.test(String(url))
+      )
+    ).toHaveLength(2);
+    routesReady.resolve();
+    await vi.waitFor(() => expect(state.put).toHaveBeenCalledTimes(1));
+    await state.request();
+    expect(route).toHaveBeenCalledTimes(5);
+    writeReady.resolve();
+    await Promise.all(state.waits);
+    expect(state.put).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(state.stored() ?? '{}').capturedAt).not.toBe(cached.capturedAt);
+
+    state.set(cached);
+    await state.request();
+    await Promise.all(state.waits);
+    expect(route).toHaveBeenCalledTimes(10);
+    expect(state.put).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps generations separate and cancels an older refresh after publication', async () => {
+    const state = fixture();
+    const gate = deferred();
+    const route = holdPublicRoutes(gate.promise);
+    state.set(bundle(1, 6 * 60 * 1000));
+    await state.request();
+    currentGeneration = 2;
+    state.set(bundle(2, 6 * 60 * 1000));
+    const response = await state.request();
+    await expect(response.json()).resolves.toMatchObject({ generation: 2 });
+    expect(route).toHaveBeenCalledTimes(10);
+    gate.resolve();
+    await Promise.all(state.waits);
+    expect(state.put).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(state.stored() ?? '{}').generation).toBe(2);
+  });
+
+  it('bounds sharing of a stuck refresh and keeps its late settlement from clearing the retry', async () => {
+    const state = fixture();
+    const cached = bundle(1, 6 * 60 * 1000);
+    state.set(cached);
+    const startedAt = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(startedAt);
+    const original = deferred();
+    const replacement = deferred();
+    const route = vi.spyOn(publicRoute, 'request').mockImplementation(async (url) => {
+      await (route.mock.calls.length <= 5 ? original.promise : replacement.promise);
+      return Response.json(payload(String(url)));
+    });
+    const first = await state.request();
+    expect(await first.text()).toBe(JSON.stringify(cached));
+    clock.mockReturnValue(startedAt + 29_999);
+    await state.request();
+    expect(route).toHaveBeenCalledTimes(5);
+    clock.mockReturnValue(startedAt + 30_000);
+    const retried = await state.request();
+    expect(await retried.text()).toBe(JSON.stringify(cached));
+    expect(retried.headers.get('cache-control')).toBe('no-store');
+    expect(route).toHaveBeenCalledTimes(10);
+    original.resolve();
+    await state.waits[0];
+    state.set(cached);
+    await state.request();
+    expect(route).toHaveBeenCalledTimes(10);
+    replacement.resolve();
+    await Promise.all(state.waits);
+    expect(state.put).toHaveBeenCalledTimes(2);
+  });
+
+  it('cancels before building when publication advances during the initial R2 read', async () => {
+    const state = fixture(true);
+    const cached = bundle(1, 6 * 60 * 1000);
+    state.set(cached);
+    const readStarted = deferred();
+    const readReady = deferred();
+    const get = state.get.getMockImplementation();
+    state.get.mockImplementation(async () => {
+      const snapshot = await get?.();
+      readStarted.resolve();
+      await readReady.promise;
+      return snapshot ?? null;
+    });
+    const route = vi
+      .spyOn(publicRoute, 'request')
+      .mockImplementation(async (url) => Response.json(payload(String(url))));
+    const pending = state.request();
+    await readStarted.promise;
+    currentGeneration = 2;
+    readReady.resolve();
+    const response = await pending;
+    expect(await response.text()).toBe(JSON.stringify(cached));
+    expect(response.headers.get(D1_BOOKMARK_HEADER)).toBe('response-bookmark-1');
+    await Promise.all(state.waits);
+    expect(route).not.toHaveBeenCalled();
+    expect(state.put).not.toHaveBeenCalled();
+  });
+
+  it.each(['bucket', 'environment'])('isolates stale refreshes by %s', async (scope) => {
+    const first = fixture();
+    const second = fixture();
+    first.set(bundle(1, 6 * 60 * 1000));
+    second.set(bundle(1, 6 * 60 * 1000));
+    const gate = deferred();
+    const route = holdPublicRoutes(gate.promise);
+    await first.request();
+    await second.request(
+      undefined,
+      scope === 'environment'
+        ? { ...second.env, RAW: first.env.RAW, ENVIRONMENT: 'another-environment' }
+        : second.env
+    );
+    expect(route).toHaveBeenCalledTimes(10);
+    gate.resolve();
+    await Promise.all([...first.waits, ...second.waits]);
+    expect(first.put.mock.calls.length + second.put.mock.calls.length).toBe(2);
+  });
+
+  it.each(['route', 'write'])(
+    'retries after a failed %s without retaining a rejected refresh',
+    async (stage) => {
+      const state = fixture();
+      state.set(bundle(1, 6 * 60 * 1000));
+      const gate = deferred();
+      let fail = true;
+      const route = vi.spyOn(publicRoute, 'request').mockImplementation(async (url) => {
+        await gate.promise;
+        if (stage === 'route' && fail) {
+          throw new Error('synthetic route failure');
+        }
+        return Response.json(payload(String(url)));
+      });
+      if (stage === 'write') {
+        state.put.mockRejectedValueOnce(new Error('synthetic R2 failure'));
+      }
+      await Promise.all(Array.from({ length: 4 }, () => state.request()));
+      expect(route).toHaveBeenCalledTimes(5);
+      gate.resolve();
+      await Promise.all(state.waits);
+      fail = false;
+      await state.request();
+      await Promise.all(state.waits);
+      expect(route).toHaveBeenCalledTimes(10);
+      expect(JSON.parse(state.stored() ?? '{}').generation).toBe(1);
+      expect(state.put).toHaveBeenCalledTimes(stage === 'route' ? 1 : 2);
+    }
+  );
+
+  it('bypasses coalescing for explicit bookmarks and retains every request session', async () => {
+    const state = fixture(true);
+    const cached = bundle(1, 6 * 60 * 1000);
+    state.set(cached);
+    const gate = deferred();
+    const route = holdPublicRoutes(gate.promise);
+    const bookmarks = ['client-1', 'client-2', 'client-3', 'client-4'];
+    const responses = await Promise.all(
+      bookmarks.map((bookmark) => state.request({ headers: { [D1_BOOKMARK_HEADER]: bookmark } }))
+    );
+    expect(state.anchors).toEqual(bookmarks);
+    expect(await Promise.all(responses.map((response) => response.text()))).toEqual(
+      bookmarks.map(() => JSON.stringify(cached))
+    );
+    expect(responses.map((response) => response.headers.get(D1_BOOKMARK_HEADER))).toEqual([
+      'response-bookmark-1',
+      'response-bookmark-2',
+      'response-bookmark-3',
+      'response-bookmark-4',
+    ]);
+    expect(route).toHaveBeenCalledTimes(20);
+    gate.resolve();
+    await Promise.all(state.waits);
+    expect(state.put).toHaveBeenCalledTimes(4);
+  });
+
+  it('leaves overlapping cold rebuilds and direct warmers independent', async () => {
+    const state = fixture();
+    const gate = deferred();
+    const route = holdPublicRoutes(gate.promise);
+    const responses = Array.from({ length: 4 }, () => state.request());
+    await vi.waitFor(() => expect(route).toHaveBeenCalledTimes(20));
+    gate.resolve();
+    expect((await Promise.all(responses)).map((response) => response.status)).toEqual([
+      200, 200, 200, 200,
+    ]);
+    await Promise.all(state.waits);
+    expect(state.put).toHaveBeenCalledTimes(4);
+    await Promise.all([warmHomepageBundle(state.env), warmHomepageBundle(state.env)]);
+    expect(route).toHaveBeenCalledTimes(30);
+    expect(state.put).toHaveBeenCalledTimes(6);
+  });
+
   it('starts the generation and R2 reads together on a cold request', async () => {
     const fixtureState = fixture();
     fixtureState.set(bundle());

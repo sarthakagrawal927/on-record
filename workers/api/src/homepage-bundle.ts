@@ -2,6 +2,7 @@ import type { Context } from 'hono';
 import { publicCacheGenerationFresh } from './db';
 import type { Env } from './env';
 import { publicRoute } from './routes/public';
+import { D1_BOOKMARK_HEADER } from './session';
 
 const key = 'public/homepage/v1/current-bundle.json';
 const maximumBytes = 512 * 1024;
@@ -24,6 +25,48 @@ type Bundle = {
   groups: unknown;
   sources: unknown;
 };
+
+type PendingRefresh = { expiresAt: number; promise: Promise<void> };
+const refreshSharingMs = 30_000;
+const staleRefreshes = new WeakMap<R2Bucket, Map<string, PendingRefresh>>();
+
+function refreshStaleBundle(env: Env, generation: number): Promise<void> {
+  let pending = staleRefreshes.get(env.RAW);
+  if (!pending) {
+    pending = new Map();
+    staleRefreshes.set(env.RAW, pending);
+  }
+  const now = Date.now();
+  // A stopped request may leave its I/O unresolved. Expire sharing lazily,
+  // including older generations, without changing response freshness limits.
+  for (const [key, entry] of pending) {
+    if (entry.expiresAt <= now) {
+      pending.delete(key);
+    }
+  }
+  const identity = JSON.stringify([env.ENVIRONMENT ?? null, generation]);
+  const existing = pending.get(identity);
+  if (existing) {
+    return existing.promise;
+  }
+  const refresh = publicCacheGenerationFresh(env.DB)
+    .then(async (currentGeneration) => {
+      if (currentGeneration !== generation) {
+        return;
+      }
+      const bundle = await createBundle(env, generation);
+      if (bundle) {
+        await writeBundle(env, bundle);
+      }
+    })
+    .finally(() => {
+      if (pending.get(identity)?.promise === refresh) {
+        pending.delete(identity);
+      }
+    });
+  pending.set(identity, { expiresAt: now + refreshSharingMs, promise: refresh });
+  return refresh;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -187,7 +230,14 @@ export async function homepageBundle(c: Context<{ Bindings: Env }>): Promise<Res
     const age = Date.now() - Date.parse(cached.capturedAt);
     if (age >= refreshAfterMs) {
       try {
-        c.executionCtx.waitUntil(warmHomepageBundle(c.env).catch(() => undefined));
+        const executionCtx = c.executionCtx;
+        // Only unbookmarked background refreshes share work. Foreground
+        // responses and explicitly anchored sessions remain request-local.
+        const refresh =
+          c.req.header(D1_BOOKMARK_HEADER) === undefined
+            ? refreshStaleBundle(c.env, generation)
+            : warmHomepageBundle(c.env);
+        executionCtx.waitUntil(refresh.catch(() => undefined));
       } catch {
         // The valid copy remains bounded even when no background context exists.
       }
